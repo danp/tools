@@ -5,6 +5,7 @@
 package imports
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,12 +14,14 @@ import (
 	"go/build"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +30,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/gopathwalk"
@@ -508,7 +512,7 @@ func (p *pass) assumeSiblingImportsValid() {
 		}
 		for left, rights := range refs {
 			if imp, ok := importsByName[left]; ok {
-				if m, ok := stdlib[imp.ImportPath]; ok {
+				if m, ok := p.env.stdlib[imp.ImportPath]; ok {
 					// We have the stdlib in memory; no need to guess.
 					rights = copyExports(m)
 				}
@@ -638,7 +642,7 @@ func getCandidatePkgs(ctx context.Context, wrappedCallback *scanCallback, filena
 	dupCheck := map[string]struct{}{}
 
 	// Start off with the standard library.
-	for importPath, exports := range stdlib {
+	for importPath, exports := range env.stdlib {
 		p := &pkg{
 			dir:             filepath.Join(goenv["GOROOT"], "src", importPath),
 			importPathShort: importPath,
@@ -855,6 +859,7 @@ type ProcessEnv struct {
 	initialized bool
 
 	resolver Resolver
+	stdlib   map[string][]string
 }
 
 func (e *ProcessEnv) goEnv() (map[string]string, error) {
@@ -921,6 +926,11 @@ func (e *ProcessEnv) init() error {
 	for k, v := range goEnv {
 		e.Env[k] = v
 	}
+	stdlib, err := loadStdlib(goEnv["GOROOT"])
+	if err != nil {
+		return err
+	}
+	e.stdlib = stdlib
 	e.initialized = true
 	return nil
 }
@@ -1002,7 +1012,7 @@ func addStdlibCandidates(pass *pass, refs references) error {
 		if path.Base(pkg) == pass.f.Name.Name && filepath.Join(goenv["GOROOT"], "src", pkg) == pass.srcDir {
 			return
 		}
-		exports := copyExports(stdlib[pkg])
+		exports := copyExports(pass.env.stdlib[pkg])
 		pass.addCandidate(
 			&ImportInfo{ImportPath: pkg},
 			&packageInfo{name: path.Base(pkg), exports: exports})
@@ -1014,7 +1024,7 @@ func addStdlibCandidates(pass *pass, refs references) error {
 			add("math/rand")
 			continue
 		}
-		for importPath := range stdlib {
+		for importPath := range pass.env.stdlib {
 			if path.Base(importPath) == left {
 				add(importPath)
 			}
@@ -1225,13 +1235,13 @@ func (r *gopathResolver) loadPackageNames(importPaths []string, srcDir string) (
 		return nil, err
 	}
 	for _, path := range importPaths {
-		names[path] = importPathToName(bctx, path, srcDir)
+		names[path] = importPathToName(bctx, path, srcDir, r.env.stdlib)
 	}
 	return names, nil
 }
 
 // importPathToName finds out the actual package name, as declared in its .go files.
-func importPathToName(bctx *build.Context, importPath, srcDir string) string {
+func importPathToName(bctx *build.Context, importPath, srcDir string, stdlib map[string][]string) string {
 	// Fast path for standard library without going to disk.
 	if _, ok := stdlib[importPath]; ok {
 		return path.Base(importPath) // stdlib packages always match their paths.
@@ -1431,7 +1441,7 @@ func (r *gopathResolver) scan(ctx context.Context, callback *scanCallback) error
 }
 
 func (r *gopathResolver) scoreImportPath(ctx context.Context, path string) float64 {
-	if _, ok := stdlib[path]; ok {
+	if _, ok := r.env.stdlib[path]; ok {
 		return MaxRelevance
 	}
 	return MaxRelevance - 1
@@ -1764,4 +1774,98 @@ func copyExports(pkg []string) map[string]bool {
 		m[v] = true
 	}
 	return m
+}
+
+var sym = regexp.MustCompile(`^pkg (\S+).*?, (?:var|func|type|const) ([A-Z]\w*)`)
+
+func loadStdlib(goroot string) (map[string][]string, error) {
+	r, err := readAPI(goroot)
+	if err != nil {
+		return nil, err
+	}
+	sc := bufio.NewScanner(r)
+
+	syscallJSSyms, err := syms("syscall/js", "GOOS=js", "GOARCH=wasm")
+	if err != nil {
+		return nil, err
+	}
+
+	unsafeSyms, err := syms("unsafe")
+	if err != nil {
+		return nil, err
+	}
+
+	// The APIs of the syscall/js and unsafe packages need to be computed explicitly,
+	// because they're not included in the GOROOT/api/go1.*.txt files at this time.
+	pkgs := map[string]map[string]bool{
+		"syscall/js": syscallJSSyms,
+		"unsafe":     unsafeSyms,
+	}
+	paths := []string{"syscall/js", "unsafe"}
+
+	for sc.Scan() {
+		l := sc.Text()
+		if m := sym.FindStringSubmatch(l); m != nil {
+			path, sym := m[1], m[2]
+
+			if _, ok := pkgs[path]; !ok {
+				pkgs[path] = map[string]bool{}
+				paths = append(paths, path)
+			}
+			pkgs[path][sym] = true
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][]string)
+	for _, path := range paths {
+		pkg := pkgs[path]
+		for sym := range pkg {
+			out[path] = append(out[path], sym)
+		}
+	}
+	return out, nil
+}
+
+func readAPI(goroot string) (io.Reader, error) {
+	entries, err := os.ReadDir(filepath.Join(goroot, "api"))
+	if err != nil {
+		return nil, err
+	}
+	var readers []io.Reader
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "go") && strings.HasSuffix(name, ".txt") {
+			p := filepath.Join(goroot, "api", name)
+			f, err := os.Open(p)
+			if err != nil {
+				return nil, err
+			}
+			readers = append(readers, f)
+		}
+	}
+	return io.MultiReader(readers...), nil
+}
+
+// syms computes the exported symbols in the specified package.
+func syms(pkg string, extraEnv ...string) (map[string]bool, error) {
+	var env []string
+	if len(extraEnv) != 0 {
+		env = append(os.Environ(), extraEnv...)
+	}
+	pkgs, err := packages.Load(&packages.Config{Mode: packages.NeedTypes, Env: env}, pkg)
+	if err != nil {
+		return nil, err
+	} else if len(pkgs) != 1 {
+		return nil, fmt.Errorf("got %d packages, want one package %q", len(pkgs), pkg)
+	}
+	syms := make(map[string]bool)
+	for _, name := range pkgs[0].Types.Scope().Names() {
+		if token.IsExported(name) {
+			syms[name] = true
+		}
+	}
+	return syms, nil
 }

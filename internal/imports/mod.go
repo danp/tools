@@ -534,7 +534,7 @@ func (r *ModuleResolver) scan(ctx context.Context, callback *scanCallback) error
 }
 
 func (r *ModuleResolver) scoreImportPath(ctx context.Context, path string) float64 {
-	if _, ok := stdlib[path]; ok {
+	if _, ok := r.env.stdlib[path]; ok {
 		return MaxRelevance
 	}
 	mod, _ := r.findPackage(path)
