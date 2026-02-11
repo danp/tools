@@ -19,10 +19,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/telemetry/counter"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
+	"golang.org/x/tools/gopls/internal/filewatcher"
 	debuglog "golang.org/x/tools/gopls/internal/debug/log"
 	"golang.org/x/tools/gopls/internal/filecache"
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -392,8 +394,24 @@ func (s *server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 	// (We don't need to wait for diagnosis to finish.)
 	nsnapshots.Wait()
 
-	// Register for file watching notifications, if they are supported.
-	if err := s.updateWatchedDirectories(ctx); err != nil {
+	// Set up file watching, either via the internal file watcher or by
+	// registering for client-side notifications.
+	//
+	// Check the per-folder options (not session-level s.Options()) because
+	// the client configuration is fetched per-folder in addView and is not
+	// propagated to session-level options until DidChangeConfiguration.
+	useInternal := false
+	for _, v := range s.session.Views() {
+		if v.Folder().Options.InternalFileWatcher {
+			useInternal = true
+			break
+		}
+	}
+	if useInternal {
+		if err := s.startInternalFileWatcher(ctx); err != nil {
+			event.Error(ctx, "failed to start internal file watcher", err)
+		}
+	} else if err := s.updateWatchedDirectories(ctx); err != nil {
 		event.Error(ctx, "failed to register for file watching notifications", err)
 	}
 
@@ -489,6 +507,105 @@ func (s *server) registerWatchedDirectoriesLocked(ctx context.Context, patterns 
 		return err
 	}
 	s.watchRegistrationCount++
+	return nil
+}
+
+// startInternalFileWatcher creates and starts the internal file watcher.
+// It watches each view's folder directory using filter functions derived
+// from the view's settings (directoryFilters and file extensions).
+func (s *server) startInternalFileWatcher(ctx context.Context) error {
+	views := s.session.Views()
+	if len(views) == 0 {
+		return nil
+	}
+
+	// Build filter functions from the view settings.
+	//
+	// For directory filtering, combine the default skip rules (dot-prefixed,
+	// underscore-prefixed, testdata) with the user's directoryFilters setting.
+	// For file filtering, allow the same extensions that would be sent to the
+	// client in glob patterns.
+	type folderInfo struct {
+		dir         string
+		pathInclude func(string) bool
+	}
+	var folders []folderInfo
+	allowedExts := map[string]bool{
+		"go":   true,
+		"mod":  true,
+		"sum":  true,
+		"work": true,
+	}
+	for _, v := range views {
+		opts := v.Folder().Options
+		folders = append(folders, folderInfo{
+			dir:         v.Folder().Dir.Path(),
+			pathInclude: cache.PathIncludeFunc(opts.DirectoryFilters),
+		})
+		for _, ext := range opts.TemplateExtensions {
+			allowedExts[ext] = true
+		}
+	}
+
+	skipDir := func(dir string) bool {
+		if filewatcher.DefaultSkipDir(dir) {
+			return true
+		}
+		// Evaluate directoryFilters relative to any matching folder.
+		for _, f := range folders {
+			if rel, err := filepath.Rel(f.dir, dir); err == nil && !strings.HasPrefix(rel, "..") {
+				if !f.pathInclude(rel) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	skipFile := func(path string) bool {
+		ext := strings.TrimPrefix(filepath.Ext(path), ".")
+		return !allowedExts[ext]
+	}
+
+	w, err := filewatcher.New(
+		500*time.Millisecond,
+		nil, // logger
+		skipDir,
+		skipFile,
+		func(events []protocol.FileEvent) {
+			for _, e := range events {
+				var action string
+				switch e.Type {
+				case protocol.Created:
+					action = "create"
+				case protocol.Changed:
+					action = "change"
+				case protocol.Deleted:
+					action = "delete"
+				}
+				fmt.Fprintf(os.Stderr, "gopls filewatcher: %s %s\n", action, e.URI.Path())
+			}
+			if err := s.DidChangeWatchedFiles(ctx, &protocol.DidChangeWatchedFilesParams{
+				Changes: events,
+			}); err != nil {
+				event.Error(ctx, "internal file watcher notification failed", err)
+			}
+		},
+		func(err error) {
+			event.Error(ctx, "internal file watcher error", err)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	s.fileWatcher = w
+
+	for _, f := range folders {
+		fmt.Fprintf(os.Stderr, "gopls filewatcher: watching %s\n", f.dir)
+		if err := w.WatchDir(f.dir); err != nil {
+			event.Error(ctx, fmt.Sprintf("watching %s", f.dir), err)
+		}
+	}
+
 	return nil
 }
 
@@ -648,6 +765,13 @@ func (s *server) Shutdown(ctx context.Context) error {
 		event.Log(ctx, "server shutdown without initialization")
 	}
 	if s.state != serverShutDown {
+		// Stop the internal file watcher, if any.
+		if s.fileWatcher != nil {
+			if err := s.fileWatcher.Close(); err != nil {
+				event.Error(ctx, "closing internal file watcher", err)
+			}
+		}
+
 		// Wait for the webserver (if any) to finish.
 		if s.web != nil {
 			s.web.server.Shutdown(ctx) // ignore error

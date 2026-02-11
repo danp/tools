@@ -109,7 +109,7 @@ func (m *headlessMCP) Run(ctx context.Context, args ...string) error {
 	errHandler := func(err error) {
 		log.Printf("watch error: %v", err)
 	}
-	w, err := filewatcher.New(500*time.Millisecond, nil, func(events []protocol.FileEvent) {
+	w, err := filewatcher.New(500*time.Millisecond, nil, nil, nil, func(events []protocol.FileEvent) {
 		if len(events) == 0 {
 			return
 		}

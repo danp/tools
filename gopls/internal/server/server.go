@@ -27,6 +27,7 @@ import (
 
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
+	"golang.org/x/tools/gopls/internal/filewatcher"
 	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/golang/splitpkg"
 	"golang.org/x/tools/gopls/internal/progress"
@@ -129,6 +130,11 @@ type server struct {
 	// terminated with the StopProfile command.
 	ongoingProfileMu sync.Mutex
 	ongoingProfile   *os.File // if non-nil, an ongoing profile is writing to this file
+
+	// fileWatcher is an optional internal file watcher, used when the
+	// "internalFileWatcher" setting is enabled. When non-nil, the server
+	// watches the filesystem directly instead of relying on the client.
+	fileWatcher *filewatcher.Watcher
 
 	// Track most recently requested options.
 	optionsMu sync.Mutex

@@ -27,6 +27,14 @@ var ErrClosed = errors.New("file watcher: watcher already closed")
 type Watcher struct {
 	logger *slog.Logger
 
+	// skipDir reports whether the directory at the given absolute path should
+	// be skipped (not watched, events ignored). If nil, DefaultSkipDir is used.
+	skipDir func(path string) bool
+
+	// skipFile reports whether the file at the given absolute path should
+	// be skipped (events ignored). If nil, DefaultSkipFile is used.
+	skipFile func(path string) bool
+
 	stop chan struct{}  // closed by Close to terminate run and process loop
 	wg   sync.WaitGroup // counts the number of active run and process goroutines (max 2)
 
@@ -54,13 +62,25 @@ type Watcher struct {
 // The provided event handler is called sequentially with a batch of file events,
 // but the error handler is called concurrently. The watcher blocks until the
 // handler returns, so the handlers should be fast and non-blocking.
-func New(delay time.Duration, logger *slog.Logger, eventsHandler func([]protocol.FileEvent), errHandler func(error)) (*Watcher, error) {
+//
+// skipDir and skipFile, if non-nil, override the default filtering of
+// directories and files. They receive absolute paths. If nil,
+// [DefaultSkipDir] and [DefaultSkipFile] are used.
+func New(delay time.Duration, logger *slog.Logger, skipDir, skipFile func(string) bool, eventsHandler func([]protocol.FileEvent), errHandler func(error)) (*Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
+	if skipDir == nil {
+		skipDir = DefaultSkipDir
+	}
+	if skipFile == nil {
+		skipFile = DefaultSkipFile
+	}
 	w := &Watcher{
 		logger:    logger,
+		skipDir:   skipDir,
+		skipFile:  skipFile,
 		watcher:   watcher,
 		knownDirs: make(map[string]struct{}),
 		stop:      make(chan struct{}),
@@ -264,24 +284,19 @@ func (w *Watcher) signal() {
 	}
 }
 
-// skipDir reports whether the input dir should be skipped.
-// Directories that are unlikely to contain Go source files relevant for
-// analysis, such as .git directories or testdata, should be skipped to
-// avoid unnecessary file system notifications. This reduces noise and
-// improves efficiency. Conversely, any directory that might contain Go
-// source code should be watched to ensure that gopls can respond to
-// file changes.
-func skipDir(dirName string) bool {
-	// TODO(hxjiang): the file watcher should honor gopls directory
-	// filter or the new go.mod ignore directive, or actively listening
-	// to gopls register capability request with method
-	// "workspace/didChangeWatchedFiles" like a real LSP client.
-	return strings.HasPrefix(dirName, ".") || strings.HasPrefix(dirName, "_") || dirName == "testdata"
+// DefaultSkipDir reports whether the directory at the given absolute path
+// should be skipped. It skips directories whose base name starts with "."
+// or "_", or equals "testdata".
+func DefaultSkipDir(path string) bool {
+	name := filepath.Base(path)
+	return strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata"
 }
 
-// skipFile reports whether the file should be skipped.
-func skipFile(fileName string) bool {
-	switch strings.TrimPrefix(filepath.Ext(fileName), ".") {
+// DefaultSkipFile reports whether the file at the given absolute path
+// should be skipped. It skips files whose extension is not one of
+// .go, .mod, .sum, .work, or .s.
+func DefaultSkipFile(path string) bool {
+	switch strings.TrimPrefix(filepath.Ext(path), ".") {
 	case "go", "mod", "sum", "work", "s":
 		return false
 	default:
@@ -294,7 +309,7 @@ func skipFile(fileName string) bool {
 func (w *Watcher) WatchDir(path string) error {
 	return filepath.WalkDir(filepath.Clean(path), func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
-			if skipDir(d.Name()) {
+			if w.skipDir(path) {
 				return filepath.SkipDir
 			}
 
@@ -327,10 +342,10 @@ func (w *Watcher) convertEvent(event fsnotify.Event) (_ protocol.FileEvent, isDi
 	}
 
 	// Filter out events for directories and files that are not of interest.
-	if isDir && skipDir(filepath.Base(event.Name)) {
+	if isDir && w.skipDir(event.Name) {
 		return protocol.FileEvent{}, true
 	}
-	if !isDir && skipFile(filepath.Base(event.Name)) {
+	if !isDir && w.skipFile(event.Name) {
 		return protocol.FileEvent{}, false
 	}
 
@@ -462,14 +477,15 @@ func (w *Watcher) walkDir(path string, isDir bool, errHandler func(error), fn fu
 	}
 
 	for _, e := range entries {
-		if e.IsDir() && skipDir(e.Name()) {
+		p := filepath.Join(path, e.Name())
+		if e.IsDir() && w.skipDir(p) {
 			continue
 		}
-		if !e.IsDir() && skipFile(e.Name()) {
+		if !e.IsDir() && w.skipFile(p) {
 			continue
 		}
 
-		w.walkDir(filepath.Join(path, e.Name()), e.IsDir(), errHandler, fn)
+		w.walkDir(p, e.IsDir(), errHandler, fn)
 	}
 }
 

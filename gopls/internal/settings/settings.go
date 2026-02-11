@@ -172,6 +172,12 @@ type BuildOptions struct {
 	// gopls has to do to keep your workspace up to date.
 	ExpandWorkspaceToModule bool `status:"experimental"`
 
+	// InternalFileWatcher enables gopls' built-in file watcher based on
+	// fsnotify, instead of relying on the LSP client to watch files.
+	// This can be useful when the client's file watcher is unreliable
+	// or unsupported.
+	InternalFileWatcher bool `status:"experimental"`
+
 	// StandaloneTags specifies a set of build constraints that identify
 	// individual Go source files that make up the entire main package of an
 	// executable.
@@ -1167,6 +1173,8 @@ func (o *Options) setOne(name string, value any) (applied []CounterPath, _ error
 
 	case "workspaceFiles":
 		return nil, setStringSlice(&o.WorkspaceFiles, value)
+	case "internalFileWatcher":
+		return setBool(&o.InternalFileWatcher, value)
 	case "completionDocumentation":
 		return setBool(&o.CompletionDocumentation, value)
 	case "usePlaceholders":
