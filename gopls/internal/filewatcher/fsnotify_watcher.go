@@ -278,7 +278,7 @@ func skipDir(dirName string) bool {
 	// filter or the new go.mod ignore directive, or actively listening
 	// to gopls register capability request with method
 	// "workspace/didChangeWatchedFiles" like a real LSP client.
-	return strings.HasPrefix(dirName, ".") || strings.HasPrefix(dirName, "_") || dirName == "testdata"
+	return strings.HasPrefix(dirName, ".") || strings.HasPrefix(dirName, "_") || dirName == "testdata" || dirName == "node_modules"
 }
 
 // skipFile reports whether the file should be skipped.

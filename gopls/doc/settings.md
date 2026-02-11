@@ -121,6 +121,18 @@ gopls has to do to keep your workspace up to date.
 
 Default: `true`.
 
+<a id='internalFileWatcher'></a>
+### `internalFileWatcher bool`
+
+**This setting is experimental and may be deleted.**
+
+internalFileWatcher enables gopls' built-in file watcher based on
+fsnotify, instead of relying on the LSP client to watch files.
+This can be useful when the client's file watcher is unreliable
+or unsupported.
+
+Default: `false`.
+
 <a id='standaloneTags'></a>
 ### `standaloneTags []string`
 

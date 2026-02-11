@@ -55,6 +55,42 @@ package subdir
 	}
 }
 
+// TestInternalFileWatcher verifies that when the internalFileWatcher setting
+// is enabled, the server detects file changes on disk using its own fsnotify
+// watcher instead of relying on the client's didChangeWatchedFiles
+// notifications. Since no client-side watch patterns are registered, the fake
+// editor's didChangeWatchedFiles notification carries no matching events. The
+// only way for the server to learn about the file change is through the
+// internal watcher.
+func TestInternalFileWatcher(t *testing.T) {
+	const files = `
+-- go.mod --
+module mod.test
+
+go 1.18
+-- a/a.go --
+package a
+`
+	WithOptions(
+		Settings{
+			"internalFileWatcher": true,
+		},
+	).Run(t, files, func(t *testing.T, env *Env) {
+		env.OnceMet(InitialWorkspaceLoad)
+
+		// Write a new file with an unused variable diagnostic.
+		// The fake editor sends an empty didChangeWatchedFiles to the server
+		// (no client-side watch patterns match), so the server can only learn
+		// about this file through the internal fsnotify watcher.
+		env.WriteWorkspaceFile("a/b.go", "package a\n\nfunc _() {\n\tx := 1\n}\n")
+		env.Await(Diagnostics(env.AtRegexp("a/b.go", "x")))
+
+		// Fix the diagnostic and verify it clears.
+		env.WriteWorkspaceFile("a/b.go", "package a\n\nfunc _() {\n}\n")
+		env.Await(NoDiagnostics(ForFile("a/b.go")))
+	})
+}
+
 // This test checks that we surface errors for invalid subdir watch patterns,
 // as the triple of ("off"|"on"|"auto") may be confusing to users inclined to
 // use (true|false) or some other truthy value.
