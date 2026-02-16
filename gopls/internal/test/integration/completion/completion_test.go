@@ -774,6 +774,69 @@ func F3[K comparable, V any](map[K]V, chan V) {}
 	})
 }
 
+func TestCompletionInsideBrokenConditionsAndBuiltins(t *testing.T) {
+	const files = `
+-- go.mod --
+module mod.com
+
+go 1.23
+-- main.go --
+package main
+
+func _() {
+	foobar := []int{1, 2, 3}
+	if len(foo
+	if len(foo)
+	if len(foobar)
+	if foo
+	if foobar
+	for len(foo
+	for len(foo)
+	for len(foobar)
+	for foo
+	for foobar
+}
+`
+
+	tests := []struct {
+		name       string
+		pattern    string
+		typedSoFar string
+	}{
+		{name: "broken-len-arg", pattern: `len\(foo`, typedSoFar: "len(foo"},
+		{name: "closed-len-arg", pattern: `len\(foo\)`, typedSoFar: "len(foo)"},
+		{name: "closed-len-foobar", pattern: `len\(foobar\)`, typedSoFar: "len(foobar)"},
+		{name: "broken-if-cond", pattern: "if foo", typedSoFar: "if foo"},
+		{name: "if-cond", pattern: "if foobar", typedSoFar: "if foobar"},
+		{name: "broken-for-cond", pattern: "for foo", typedSoFar: "for foo"},
+		{name: "for-cond", pattern: "for foobar", typedSoFar: "for foobar"},
+	}
+
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				loc := env.RegexpSearch("main.go", test.pattern)
+				loc.Range.Start.Character += uint32(protocol.UTF16Len([]byte(test.typedSoFar)))
+				completions := env.Completion(loc)
+				if len(completions.Items) == 0 {
+					t.Fatalf("no completion items for %q", test.pattern)
+				}
+				gotFoobar := false
+				for _, item := range completions.Items {
+					if item.Label == "foobar" {
+						gotFoobar = true
+						break
+					}
+				}
+				if !gotFoobar {
+					t.Fatalf("missing \"foobar\" completion for %q; got labels: %v", test.pattern, labels(completions.Items))
+				}
+			})
+		}
+	})
+}
+
 func TestCompleteAllFields(t *testing.T) {
 	// This test verifies that completion results always include all struct fields.
 	// See golang/go#53992.
