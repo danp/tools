@@ -572,6 +572,14 @@ func Completion(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, p
 			return nil, nil, nil
 		}
 	case *ast.Ident:
+		// Don't treat selector idents as defining idents, even if the parser
+		// synthesized one for an incomplete selector (for example "x._").
+		if len(path) > 1 {
+			if sel, ok := path[1].(*ast.SelectorExpr); ok && sel.Sel == n {
+				break
+			}
+		}
+
 		// Don't offer completions for (most) defining identifiers.
 		if obj, ok := info.Defs[n]; ok {
 			if v, ok := obj.(*types.Var); ok && v.IsField() && v.Embedded() {
@@ -675,7 +683,6 @@ func Completion(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, p
 	if surrounding := c.containingIdent(pgf.Src); surrounding != nil {
 		c.setSurrounding(surrounding)
 	}
-
 	c.inference = expectedCandidate(ctx, c)
 
 	err = c.collectCompletions(ctx)
@@ -1344,8 +1351,23 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 
 	// True selector?
 	if tv, ok := c.pkg.TypesInfo().Types[sel.X]; ok {
+		if !typeIsValid(tv.Type) {
+			// In malformed files, the inferred type of sel.X can be invalid even when
+			// syntax nearby is still rich enough to offer useful selector candidates.
+			// Recover fields from the syntactic type name in simple composite-literal
+			// initializers such as "x := X{...}".
+			if c.enqueueSyntacticSelectorFields(sel) {
+				return nil
+			}
+		}
 		c.methodsAndFields(tv.Type, tv.Addressable(), nil, c.deepState.enqueue)
 		c.addPostfixSnippetCandidates(ctx, sel)
+		return nil
+	}
+
+	// If type information for the selector receiver is missing, try syntactic
+	// recovery before treating this as a potentially package-qualified selector.
+	if c.enqueueSyntacticSelectorFields(sel) {
 		return nil
 	}
 
@@ -1391,6 +1413,279 @@ func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
 	c.unimported(ctx, metadata.PackageName(id.Name), prefix)
 	return nil
 
+}
+
+// enqueueSyntacticSelectorFields attempts to recover selector candidates for an
+// invalidly typed identifier by inferring the identifier's type name from its
+// initializer syntax (for example, "x := X{...}") and then enumerating fields
+// from a matching struct type declaration in the current file.
+func (c *completer) enqueueSyntacticSelectorFields(sel *ast.SelectorExpr) bool {
+	typeName := c.inferredTypeNameForExpr(sel.X, sel.Pos())
+	if typeName == "" {
+		return false
+	}
+	st := c.findStructType(typeName, sel.Pos())
+	if st == nil {
+		return false
+	}
+
+	added := false
+	for _, field := range st.Fields.List {
+		typ := golang.FormatNode(c.pkg.FileSet(), field.Type)
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				continue
+			}
+			c.items = append(c.items, CompletionItem{
+				Label:      name.Name,
+				InsertText: name.Name,
+				Detail:     typ,
+				Kind:       protocol.FieldCompletion,
+				Score:      stdScore - 0.01,
+			})
+			added = true
+		}
+	}
+	return added
+}
+
+func (c *completer) inferredTypeNameForExpr(expr ast.Expr, before token.Pos) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return c.inferredTypeNameForSelectorIdent(e, before)
+	case *ast.SelectorExpr:
+		base := c.inferredTypeNameForExpr(e.X, e.Pos())
+		if base == "" || e.Sel == nil {
+			return ""
+		}
+		st := c.findStructType(base, e.Pos())
+		if st == nil {
+			return ""
+		}
+		return fieldTypeName(st, e.Sel.Name)
+	default:
+		return ""
+	}
+}
+
+func (c *completer) inferredTypeNameForSelectorIdent(id *ast.Ident, before token.Pos) string {
+	if obj, ok := c.pkg.TypesInfo().ObjectOf(id).(*types.Var); ok && obj.Pos().IsValid() {
+		if name := c.inferredTypeNameFromVarInitPos(obj.Pos()); name != "" {
+			return name
+		}
+	}
+	return c.inferredTypeNameFromMatchingAssign(id.Name, before)
+}
+
+func (c *completer) inferredTypeNameFromVarInitPos(pos token.Pos) string {
+	var name string
+	ast.Inspect(c.pgf.File, func(n ast.Node) bool {
+		if name != "" {
+			return false
+		}
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range n.Lhs {
+				id, ok := lhs.(*ast.Ident)
+				if !ok || id.Pos() != pos {
+					continue
+				}
+				rhs := i
+				if len(n.Rhs) == 1 {
+					rhs = 0
+				}
+				if rhs < len(n.Rhs) {
+					name = typeNameFromExpr(n.Rhs[rhs])
+				}
+				return false
+			}
+		case *ast.ValueSpec:
+			for i, lhs := range n.Names {
+				if lhs.Pos() != pos {
+					continue
+				}
+				if n.Type != nil {
+					name = typeName(n.Type)
+					return false
+				}
+				if i < len(n.Values) {
+					name = typeNameFromExpr(n.Values[i])
+				}
+				return false
+			}
+		}
+		return true
+	})
+	return name
+}
+
+func (c *completer) inferredTypeNameFromMatchingAssign(ident string, before token.Pos) string {
+	var (
+		name         string
+		bestAt       token.Pos
+		targetScopes = c.visibleScopesAt(before)
+	)
+	if len(targetScopes) == 0 {
+		return ""
+	}
+	ast.Inspect(c.pgf.File, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range n.Lhs {
+				id, ok := lhs.(*ast.Ident)
+				if !ok || id.Name != ident || id.Pos() >= before || !c.nodePosVisible(id.Pos(), targetScopes) {
+					continue
+				}
+				rhs := i
+				if len(n.Rhs) == 1 {
+					rhs = 0
+				}
+				if rhs >= len(n.Rhs) {
+					continue
+				}
+				if inferred := typeNameFromExpr(n.Rhs[rhs]); inferred != "" && id.Pos() > bestAt {
+					bestAt = id.Pos()
+					name = inferred
+				}
+			}
+		case *ast.ValueSpec:
+			for i, lhs := range n.Names {
+				if lhs.Name != ident || lhs.Pos() >= before || !c.nodePosVisible(lhs.Pos(), targetScopes) {
+					continue
+				}
+				inferred := ""
+				if n.Type != nil {
+					inferred = typeName(n.Type)
+				} else if i < len(n.Values) {
+					inferred = typeNameFromExpr(n.Values[i])
+				}
+				if inferred != "" && lhs.Pos() > bestAt {
+					bestAt = lhs.Pos()
+					name = inferred
+				}
+			}
+		}
+		return true
+	})
+	return name
+}
+
+func typeNameFromExpr(e ast.Expr) string {
+	lit, ok := e.(*ast.CompositeLit)
+	if !ok {
+		return ""
+	}
+	return typeName(lit.Type)
+}
+
+func typeName(e ast.Expr) string {
+	switch e := e.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return e.Sel.Name
+	case *ast.ParenExpr:
+		return typeName(e.X)
+	case *ast.StarExpr:
+		return typeName(e.X)
+	case *ast.IndexExpr:
+		return typeName(e.X)
+	case *ast.IndexListExpr:
+		return typeName(e.X)
+	default:
+		return ""
+	}
+}
+
+func (c *completer) findStructType(name string, before token.Pos) *ast.StructType {
+	if before == token.NoPos {
+		return nil
+	}
+	targetScopes := c.visibleScopesAt(before)
+	if len(targetScopes) == 0 {
+		return nil
+	}
+
+	var (
+		st        *ast.StructType
+		bestScope = -1
+		bestPos   token.Pos
+	)
+	ast.Inspect(c.pgf.File, func(n ast.Node) bool {
+		spec, ok := n.(*ast.TypeSpec)
+		if !ok || spec.Name == nil || spec.Name.Name != name {
+			return true
+		}
+		s, _ := spec.Type.(*ast.StructType)
+		if s == nil {
+			return true
+		}
+		scope := c.scopeDepthAt(spec.Pos(), targetScopes)
+		if scope < 0 {
+			return true
+		}
+		if scope > bestScope || (scope == bestScope && spec.Pos() > bestPos) {
+			bestScope = scope
+			bestPos = spec.Pos()
+			st = s
+		}
+		return true
+	})
+	return st
+}
+
+func (c *completer) visibleScopesAt(pos token.Pos) map[ast.Node]int {
+	if pos == token.NoPos {
+		return nil
+	}
+	path, _ := goastutil.PathEnclosingInterval(c.pgf.File, pos, pos)
+	scopes := make(map[ast.Node]int)
+	for depth, n := range path {
+		if isScopeNode(n) {
+			scopes[n] = depth
+		}
+	}
+	return scopes
+}
+
+func (c *completer) nodePosVisible(pos token.Pos, visible map[ast.Node]int) bool {
+	return c.scopeDepthAt(pos, visible) >= 0
+}
+
+func (c *completer) scopeDepthAt(pos token.Pos, visible map[ast.Node]int) int {
+	path, _ := goastutil.PathEnclosingInterval(c.pgf.File, pos, pos)
+	for _, n := range path {
+		if !isScopeNode(n) {
+			continue
+		}
+		if depth, ok := visible[n]; ok {
+			return depth
+		}
+	}
+	return -1
+}
+
+func isScopeNode(n ast.Node) bool {
+	switch n.(type) {
+	case *ast.File, *ast.BlockStmt, *ast.IfStmt, *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt, *ast.CaseClause, *ast.CommClause:
+		return true
+	default:
+		return false
+	}
+}
+
+func fieldTypeName(st *ast.StructType, field string) string {
+	if st == nil || st.Fields == nil {
+		return ""
+	}
+	for _, f := range st.Fields.List {
+		for _, name := range f.Names {
+			if name.Name == field {
+				return typeName(f.Type)
+			}
+		}
+	}
+	return ""
 }
 
 // unimportedScore returns a score for an unimported package that is generally

@@ -7,6 +7,7 @@ package completion
 import (
 	"testing"
 
+	"golang.org/x/tools/gopls/internal/protocol"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 )
 
@@ -54,4 +55,185 @@ go 1.18
 		env.CreateBuffer("p.go", "package p\nfunc _() {\n\tfor i := struct")
 		env.AfterChange()
 	})
+}
+
+func TestCompletionAfterSelectorWithMissingBrace(t *testing.T) {
+	const files = `
+-- go.mod --
+module example.com
+
+go 1.18
+-- p/p.go --
+package p
+
+func main() {
+	x := X{Y{1}}
+
+	{
+		x.
+
+type X struct {
+	Y Y
+}
+
+type Y struct {
+	Z int
+}
+`
+
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("p/p.go")
+		completions := env.Completion(env.RegexpSearch("p/p.go", `x\.()`))
+		if len(completions.Items) == 0 {
+			t.Fatal("Completion() returned empty results")
+		}
+
+		for _, item := range completions.Items {
+			if item.Label == "Y" {
+				return
+			}
+		}
+		t.Fatalf("Completion() did not include Y, got labels: %v", labels(completions.Items))
+	})
+}
+
+func TestCompletionAfterNestedSelectorWithMissingBrace(t *testing.T) {
+	const files = `
+-- go.mod --
+module example.com
+
+go 1.18
+-- p/p.go --
+package p
+
+func main() {
+	x := X{Y{1}}
+
+	{
+		x.Y.
+
+type X struct {
+	Y Y
+}
+
+type Y struct {
+	Z int
+}
+`
+
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("p/p.go")
+		completions := env.Completion(env.RegexpSearch("p/p.go", `x\.Y\.()`))
+		if len(completions.Items) == 0 {
+			t.Fatal("Completion() returned empty results")
+		}
+
+		for _, item := range completions.Items {
+			if item.Label == "Z" {
+				return
+			}
+		}
+		t.Fatalf("Completion() did not include Z, got labels: %v", labels(completions.Items))
+	})
+}
+
+func TestCompletionAfterSelectorWithMissingBraceUsesVisibleScope(t *testing.T) {
+	const files = `
+-- go.mod --
+module example.com
+
+go 1.18
+-- p/p.go --
+package p
+
+func main() {
+	x := X{1}
+	{
+		x := Y{2}
+		_ = x
+	}
+	{
+		x.
+
+type X struct {
+	A int
+}
+
+type Y struct {
+	B int
+}
+`
+
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("p/p.go")
+		completions := env.Completion(env.RegexpSearch("p/p.go", `x\.()`))
+		if len(completions.Items) == 0 {
+			t.Fatal("Completion() returned empty results")
+		}
+
+		gotA := false
+		gotB := false
+		for _, item := range completions.Items {
+			if item.Label == "A" {
+				gotA = true
+			}
+			if item.Label == "B" {
+				gotB = true
+			}
+		}
+		if !gotA {
+			t.Fatalf("Completion() did not include A, got labels: %v", labels(completions.Items))
+		}
+		if gotB {
+			t.Fatalf("Completion() unexpectedly included shadowed field B, got labels: %v", labels(completions.Items))
+		}
+	})
+}
+
+func TestCompletionAfterPointerNestedSelectorWithMissingBrace(t *testing.T) {
+	const files = `
+-- go.mod --
+module example.com
+
+go 1.18
+-- p/p.go --
+package p
+
+func main() {
+	x := X{&Y{1}}
+
+	{
+		x.Y.
+
+type X struct {
+	Y *Y
+}
+
+type Y struct {
+	Z int
+}
+`
+
+	Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("p/p.go")
+		completions := env.Completion(env.RegexpSearch("p/p.go", `x\.Y\.()`))
+		if len(completions.Items) == 0 {
+			t.Fatal("Completion() returned empty results")
+		}
+
+		for _, item := range completions.Items {
+			if item.Label == "Z" {
+				return
+			}
+		}
+		t.Fatalf("Completion() did not include Z, got labels: %v", labels(completions.Items))
+	})
+}
+
+func labels(items []protocol.CompletionItem) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.Label)
+	}
+	return out
 }
