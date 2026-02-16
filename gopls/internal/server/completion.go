@@ -7,8 +7,15 @@ package server
 import (
 	"context"
 	"fmt"
+	"go/scanner"
+	"go/token"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/golang/completion"
@@ -66,6 +73,19 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 		event.Error(ctx, "no completions found", err, label.Position.Of(pos))
 	}
 	if candidates == nil || surrounding == nil {
+		if snapshot.FileKind(fh) == file.Go {
+			// Only synthesize lexical fallback completions when normal completion
+			// returned no result without an explicit error, and the file has
+			// parse errors (recovery mode).
+			if err == nil && fileHasParseErrors(ctx, snapshot, fh) {
+				if fallback, err := fallbackProtocolItems(fh, pos, snapshot.Options()); err == nil && len(fallback) > 0 {
+					return &protocol.CompletionList{
+						IsIncomplete: true,
+						Items:        fallback,
+					}, nil
+				}
+			}
+		}
 		complEmpty.Inc()
 		return &protocol.CompletionList{
 			IsIncomplete: true,
@@ -96,6 +116,101 @@ func (s *server) Completion(ctx context.Context, params *protocol.CompletionPara
 		IsIncomplete: incompleteResults,
 		Items:        items,
 	}, nil
+}
+
+func fileHasParseErrors(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) bool {
+	pgf, err := snapshot.ParseGo(ctx, fh, parsego.Full)
+	return err == nil && pgf.ParseErr != nil
+}
+
+func fallbackProtocolItems(fh file.Handle, pos protocol.Position, options *settings.Options) ([]protocol.CompletionItem, error) {
+	content, err := fh.Content()
+	if err != nil {
+		return nil, err
+	}
+	mapper := protocol.NewMapper(fh.URI(), content)
+	offset, err := mapper.PositionOffset(pos)
+	if err != nil || offset < 0 || offset > len(content) {
+		return nil, nil
+	}
+	prefixStart := identPrefixStart(content, offset)
+	if prefixStart == offset {
+		return nil, nil
+	}
+	prefix := string(content[prefixStart:offset])
+	if prefix == "" {
+		return nil, nil
+	}
+
+	startPos, err := mapper.OffsetPosition(prefixStart)
+	if err != nil {
+		return nil, err
+	}
+	rng := protocol.Range{Start: startPos, End: pos}
+
+	ids := lexicalIdentifiers(content)
+	seen := make(map[string]bool)
+	items := make([]protocol.CompletionItem, 0, 8)
+	for _, id := range ids {
+		if id == prefix || !strings.HasPrefix(id, prefix) || seen[id] {
+			continue
+		}
+		seen[id] = true
+		item := protocol.CompletionItem{
+			Label:            id,
+			Kind:             protocol.VariableCompletion,
+			SortText:         id,
+			FilterText:       id,
+			InsertTextFormat: &options.InsertTextFormat,
+		}
+		item.TextEdit = &protocol.Or_CompletionItem_textEdit{
+			Value: protocol.TextEdit{
+				NewText: id,
+				Range:   rng,
+			},
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Label < items[j].Label })
+	return items, nil
+}
+
+func lexicalIdentifiers(content []byte) []string {
+	var (
+		s    scanner.Scanner
+		fset = token.NewFileSet()
+		file = fset.AddFile("", -1, len(content))
+		out  []string
+	)
+	s.Init(file, content, nil, 0)
+	for {
+		_, tok, lit := s.Scan()
+		if tok == token.EOF {
+			return out
+		}
+		if tok == token.IDENT {
+			out = append(out, lit)
+		}
+	}
+}
+
+func identPrefixStart(content []byte, offset int) int {
+	start := offset
+	for start > 0 {
+		r, size := utf8.DecodeLastRune(content[:start])
+		if r == utf8.RuneError && size == 1 {
+			break
+		}
+		if !isIdentifierChar(r) {
+			break
+		}
+		start -= size
+	}
+	return start
+}
+
+func isIdentifierChar(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 func (s *server) saveLastCompletion(uri protocol.DocumentURI, version int32, items []protocol.CompletionItem, pos protocol.Position) {
